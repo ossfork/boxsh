@@ -225,10 +225,10 @@ describe('worker pool — large batches', () => {
   test('concurrent multi-megabyte responses do not trigger worker respawn loop', () => {
     const mib = 1024 * 1024;
     const reqs = [
-      { id: 'bigA', cmd: 'dd if=/dev/zero bs=1048576 count=6 2>/dev/null | tr "\\0" A' },
-      { id: 'bigB', cmd: 'dd if=/dev/zero bs=1048576 count=6 2>/dev/null | tr "\\0" B' },
-      { id: 'bigC', cmd: 'dd if=/dev/zero bs=1048576 count=6 2>/dev/null | tr "\\0" C' },
-      { id: 'bigD', cmd: 'dd if=/dev/zero bs=1048576 count=6 2>/dev/null | tr "\\0" D' },
+      { id: 'bigA', cmd: 'node -e "process.stdout.write(Buffer.alloc(6*1048576, 0x41))"' },
+      { id: 'bigB', cmd: 'node -e "process.stdout.write(Buffer.alloc(6*1048576, 0x42))"' },
+      { id: 'bigC', cmd: 'node -e "process.stdout.write(Buffer.alloc(6*1048576, 0x43))"' },
+      { id: 'bigD', cmd: 'node -e "process.stdout.write(Buffer.alloc(6*1048576, 0x44))"' },
     ];
     const resps = rpcMany(reqs, { workers: 4, timeout_ms: 60000 });
     assert.equal(resps.length, 4);

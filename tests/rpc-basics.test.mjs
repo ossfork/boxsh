@@ -205,10 +205,77 @@ describe('rpc — stdout/stderr capture', () => {
     assert.equal(resp.stdout, 'héllo wörld\n');
   });
 
-  test('large stdout (64 KB) is captured completely', () => {
-    // Generate exactly 65536 'A' chars + newline via shell
+  test('non-UTF-8 stdout (binary output) does not crash (replaces with U+FFFD)', () => {
+    // Simulate `cat .git-index` producing raw binary bytes.
+    // Use node -e to reliably output binary bytes regardless of shell.
+    const resp = rpc({
+      id: 't',
+      cmd: 'node -e "process.stdout.write(Buffer.from([0x82,0x83,0x84]))"',
+    });
+    assert.equal(resp.exit_code, 0);
+    assert.ok(typeof resp.stdout === 'string');
+    assert.ok(resp.stdout.includes('\ufffd'), 'invalid bytes should be replaced with U+FFFD');
+  });
+
+  test('non-UTF-8 stderr does not crash', () => {
+    const resp = rpc({
+      id: 't',
+      cmd: 'node -e "process.stderr.write(Buffer.from([0x80,0x81,0x82]))"',
+    });
+    assert.equal(resp.exit_code, 0);
+    assert.ok(typeof resp.stderr === 'string');
+    assert.ok(resp.stderr.includes('\ufffd'), 'invalid bytes should be replaced with U+FFFD');
+  });
+
+  test('all invalid UTF-8 patterns are handled', () => {
+    // Comprehensive coverage of all invalid UTF-8 byte sequences:
+    //   0x80-0xBF   : continuation bytes (no lead byte)
+    //   0xC0-0xC1   : overlong 2-byte sequences
+    //   0xF5-0xFF   : lead bytes for > U+10FFFF
+    //   truncated sequences (lead byte then ASCII, not a continuation byte)
+    //   surrogates (0xED 0xA0 = U+D800)
+    //   mixed valid + invalid
+    const cmd = `node -e "
+      const buf = Buffer.from([
+        // continuation bytes: 0x80, 0xBF
+        0x80, 0xBF,
+        // overlong lead bytes: 0xC0, 0xC1
+        0xC0, 0xC1,
+        // out-of-range lead bytes: 0xF5-0xFF
+        0xF5, 0xFE, 0xFF,
+        // truncated: 0xE0 then ASCII 'A' (not a continuation byte)
+        0xE0, 0x41,
+        // truncated: 0xF0 then ASCII 'B'
+        0xF0, 0x42,
+        // surrogate: 0xED 0xA0 = start of U+D800
+        0xED, 0xA0,
+        // mixed: valid UTF-8 'hello' + invalid 0x82
+        0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x82,
+      ]);
+      process.stdout.write(buf);
+    "`;
+    const resp = rpc({ id: 't', cmd });
+    assert.equal(resp.exit_code, 0);
+    assert.ok(typeof resp.stdout === 'string');
+    // Should contain 'hello' (valid part preserved)
+    assert.ok(resp.stdout.includes('hello'), 'valid UTF-8 should be preserved');
+    // Should contain replacement chars for all invalid bytes
+    const ffdCount = (resp.stdout.match(/\ufffd/g) || []).length;
+    assert.ok(ffdCount > 0, `expected replacement chars, got ${ffdCount}`);
+  });
+
+  test('large binary output (64 KB of 0x82) does not crash', () => {
     const resp = rpc(
-      { id: 't', cmd: 'dd if=/dev/zero bs=65536 count=1 2>/dev/null | tr "\\0" A' },
+      { id: 't', cmd: 'node -e "process.stdout.write(Buffer.alloc(65536, 0x82))"' },
+      { timeout_ms: 8000 },
+    );
+    assert.equal(resp.exit_code, 0);
+    assert.ok(resp.stdout.includes('\ufffd'));
+  });
+
+  test('large stdout (64 KB) is captured completely', () => {
+    const resp = rpc(
+      { id: 't', cmd: 'node -e "process.stdout.write(Buffer.alloc(65536, 0x41))"' },
       { timeout_ms: 8000 },
     );
     assert.equal(resp.exit_code, 0);
@@ -223,9 +290,9 @@ describe('rpc — stdout/stderr capture', () => {
   });
 
   test('stdout_truncated is true when output exceeds 10 MiB', () => {
-    // Generate ~11 MiB of output (11264 x 1024-byte lines).
+    // Generate ~11 MiB of output.
     const resp = rpc(
-      { id: 't', cmd: 'dd if=/dev/zero bs=1048576 count=11 2>/dev/null | tr "\\0" A' },
+      { id: 't', cmd: 'node -e "process.stdout.write(Buffer.alloc(11 * 1048576, 0x41))"' },
       { timeout_ms: 30000 },
     );
     assert.equal(resp.stdout_truncated, true);

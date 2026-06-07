@@ -231,10 +231,12 @@ std::string rpc_serialize_response(const RpcResponse &resp) {
             if (is_error) {
                 result["content"] = json::array({{{"type", "text"}, {"text", resp.error}}});
             } else {
+                std::string safe_stdout = ensure_valid_utf8(resp.stdout_data);
+                std::string safe_stderr = ensure_valid_utf8(resp.stderr_data);
                 json sc = {
                     {"exit_code",   resp.exit_code},
-                    {"stdout",      resp.stdout_data},
-                    {"stderr",      resp.stderr_data},
+                    {"stdout",      safe_stdout},
+                    {"stderr",      safe_stderr},
                     {"duration_ms", resp.duration_ms}
                 };
                 if (resp.stdout_truncated)
@@ -540,7 +542,7 @@ static std::string tool_terminal_run(const RpcRequest &req) {
     json r;
     json sc = {
         {"id",        result.id},
-        {"output",    result.output},
+        {"output",    ensure_valid_utf8(result.output)},
         {"exited",    result.exited},
         {"exit_code", result.exited ? json(result.exit_code) : json(nullptr)},
     };
@@ -559,7 +561,7 @@ static std::string tool_terminal_send(const RpcRequest &req) {
         terminal_send(req.session_id, req.terminal_command);
         auto out = terminal_output(req.session_id);
         json sc = {
-            {"output",    out.output},
+            {"output",    ensure_valid_utf8(out.output)},
             {"exited",    out.exited},
             {"exit_code", out.exited ? json(out.exit_code) : json(nullptr)},
         };
@@ -581,7 +583,7 @@ static std::string tool_terminal_output(const RpcRequest &req) {
     try {
         auto out = terminal_output(req.session_id);
         json sc = {
-            {"output",    out.output},
+            {"output",    ensure_valid_utf8(out.output)},
             {"exited",    out.exited},
             {"exit_code", out.exited ? json(out.exit_code) : json(nullptr)},
         };
@@ -602,7 +604,7 @@ static std::string tool_terminal_kill(const RpcRequest &req) {
     json r;
     try {
         std::string snap = terminal_kill(req.session_id);
-        json sc = {{"output", snap}};
+        json sc = {{"output", ensure_valid_utf8(snap)}};
         r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
         r["structuredContent"] = sc;
     } catch (const std::exception &e) {
@@ -617,7 +619,7 @@ static std::string tool_terminal_list(const RpcRequest &req) {
     auto sessions = terminal_list();
     json arr = json::array();
     for (auto &s : sessions) {
-        arr.push_back({{"id", s.id}, {"command", s.command},
+        arr.push_back({{"id", ensure_valid_utf8(s.id)}, {"command", ensure_valid_utf8(s.command)},
                        {"alive", s.alive}, {"cols", s.cols}, {"rows", s.rows}});
     }
     std::string text = arr.dump();
