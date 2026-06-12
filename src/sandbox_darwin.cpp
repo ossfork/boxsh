@@ -419,6 +419,14 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         return res;
     }
 
+    // ── 0. Capture CWD before any filesystem mutations ───────────────────
+    // Must happen before the COW step: rmdir + clonefile may delete and
+    // recreate the overlay directory that IS the process CWD, making
+    // getcwd() return ENOENT afterwards.
+    char *cwd_buf = getcwd(nullptr, 0);
+    std::string saved_cwd = cwd_buf ? cwd_buf : "";
+    free(cwd_buf);
+
     // ── 1. COW: clonefile(src, dst) ──────────────────────────────────────
     // clonefile(2) creates an instant APFS COW snapshot of src at dst for the
     // initial workspace materialization.  If dst already contains data, treat
@@ -511,11 +519,7 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     }
 
     // ── 2. Apply Seatbelt profile ─────────────────────────────────────────
-    // Capture CWD before sandbox_init — afterwards getcwd() may fail if
-    // CWD is outside the whitelisted system paths.
-    char *cwd_buf = getcwd(nullptr, 0);
-    std::string saved_cwd = cwd_buf ? cwd_buf : "";
-    free(cwd_buf);
+    // saved_cwd was captured before the COW step (step 0).
 
     // sandbox_init() with flags=0 and a custom SBPL string is an undocumented
     // private API.  On failure we print a warning and continue without
@@ -532,9 +536,11 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
 
     // ── 3. Redirect CWD ──────────────────────────────────────────────────
     // Use the saved_cwd captured before sandbox_init.  If the old CWD was
-    // within a COW source, redirect into the clone (dst).  Otherwise, if
-    // CWD is no longer accessible (outside whitelisted paths), fall back
-    // to "/".
+    // within a COW source, redirect into the clone (dst).  Otherwise,
+    // restore the original CWD — chdir() is used directly instead of
+    // getcwd() because the sandbox may block getcwd()'s directory-tree
+    // walk even for whitelisted paths.  Fall back to "/" only if the
+    // restore fails (e.g. CWD is outside whitelisted paths with no bind).
     {
         bool redirected = false;
         for (const auto &bm : cfg.bind_mounts) {
@@ -552,15 +558,21 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
             break;
         }
 
-        // If CWD was not redirected, verify it is still accessible.
-        // With the whitelist SBPL, CWD under /Users (or other non-system
-        // paths) becomes inaccessible — fall back to "/".
-        if (!redirected) {
-            char *check = getcwd(nullptr, 0);
-            if (!check) {
-                chdir("/");
+        if (!redirected && !saved_cwd.empty()) {
+            // Try to restore the pre-sandbox CWD.  chdir() alone sets the
+            // kernel's cwd, but getcwd() may still fail inside the sandbox
+            // for paths outside the whitelist (e.g. /Users).  Use getcwd()
+            // as a gate: if it succeeds the path is fully accessible to
+            // child processes (dash, python, etc.); if not, fall back to /.
+            if (chdir(saved_cwd.c_str()) == 0) {
+                char *check = getcwd(nullptr, 0);
+                if (!check) {
+                    chdir("/");
+                } else {
+                    free(check);
+                }
             } else {
-                free(check);
+                chdir("/");
             }
         }
     }

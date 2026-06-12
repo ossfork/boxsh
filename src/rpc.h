@@ -44,6 +44,7 @@ struct RpcRequest {
 
     // tool = "write"
     std::string content; // file content to write
+    std::string encoding = "text"; // "text" (default) or "base64"
 
     // tool = "edit"
     std::vector<EditOp> edits;

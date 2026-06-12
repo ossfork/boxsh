@@ -312,6 +312,119 @@ describe('tool — write', () => {
       assert.equal(fs.readFileSync(p, 'utf8'), 'new\n');
     } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
+
+  test('write with encoding=text (explicit) behaves same as default', () => {
+    const p = path.join(os.tmpdir(), `boxsh-write-${process.pid}-${Math.random().toString(36).slice(2)}.txt`);
+    try {
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: 'hello world\n', encoding: 'text' });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(fs.readFileSync(p, 'utf8'), 'hello world\n');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('write with encoding=base64 decodes and writes binary content', () => {
+    const p = path.join(os.tmpdir(), `boxsh-write-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
+    // PNG magic bytes + IHDR chunk header
+    const raw = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+                             0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52]);
+    const b64 = raw.toString('base64');
+    try {
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: b64, encoding: 'base64' });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      const written = fs.readFileSync(p);
+      assert.ok(written.equals(raw), `base64 roundtrip mismatch: expected ${raw.toString('hex')}, got ${written.toString('hex')}`);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('write with encoding=base64 roundtrip: all 256 byte values', () => {
+    const p = path.join(os.tmpdir(), `boxsh-write-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
+    const raw = Buffer.alloc(256);
+    for (let i = 0; i < 256; i++) raw[i] = i;
+    const b64 = raw.toString('base64');
+    try {
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: b64, encoding: 'base64' });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      const written = fs.readFileSync(p);
+      assert.ok(written.equals(raw),
+        `all-256 roundtrip failed at first mismatch: expected 0x${raw.toString('hex').slice(0, 20)}..., got 0x${written.toString('hex').slice(0, 20)}...`);
+      assert.match(text(resp), /256/); // "written 256 bytes"
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('write with encoding=base64: single-padding roundtrip (2 bytes)', () => {
+    const p = path.join(os.tmpdir(), `boxsh-write-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
+    // 2 bytes → base64 ends with "=" (single padding)
+    const raw = Buffer.from([0xAB, 0xCD]);
+    const b64 = raw.toString('base64');
+    assert.ok(b64.endsWith('=') && !b64.endsWith('=='), `expected single-pad, got ${b64}`);
+    try {
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: b64, encoding: 'base64' });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.ok(fs.readFileSync(p).equals(raw),
+        `single-pad mismatch: ${raw.toString('hex')} vs ${fs.readFileSync(p).toString('hex')}`);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('write with encoding=base64: double-padding roundtrip (1 byte)', () => {
+    const p = path.join(os.tmpdir(), `boxsh-write-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
+    // 1 byte → base64 ends with "==" (double padding)
+    const raw = Buffer.from([0x7F]);
+    const b64 = raw.toString('base64');
+    assert.ok(b64.endsWith('=='), `expected double-pad, got ${b64}`);
+    try {
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: b64, encoding: 'base64' });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.ok(fs.readFileSync(p).equals(raw),
+        `double-pad mismatch: ${raw.toString('hex')} vs ${fs.readFileSync(p).toString('hex')}`);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('write with encoding=base64: no-padding roundtrip (3 bytes)', () => {
+    const p = path.join(os.tmpdir(), `boxsh-write-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
+    // 3 bytes → base64 has no padding
+    const raw = Buffer.from([0x00, 0xFF, 0x55]);
+    const b64 = raw.toString('base64');
+    assert.ok(!b64.includes('='), `expected no-pad, got ${b64}`);
+    try {
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: b64, encoding: 'base64' });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.ok(fs.readFileSync(p).equals(raw),
+        `no-pad mismatch: ${raw.toString('hex')} vs ${fs.readFileSync(p).toString('hex')}`);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('write with encoding=base64 handles content with newlines (common in LLM output)', () => {
+    const p = path.join(os.tmpdir(), `boxsh-write-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
+    // LLMs often wrap base64 with newlines.  The decoder skips \\n and \\r.
+    const raw = Buffer.from('hello binary world', 'utf8');
+    const b64 = raw.toString('base64');
+    // Insert artificial line breaks every 4 chars
+    const wrapped = b64.replace(/(.{4})/g, '$1\n');
+    try {
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: wrapped, encoding: 'base64' });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      const written = fs.readFileSync(p, 'utf8');
+      assert.equal(written, 'hello binary world');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('write with invalid encoding returns error', () => {
+    const p = path.join(os.tmpdir(), `boxsh-write-${process.pid}-${Math.random().toString(36).slice(2)}.txt`);
+    try {
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: 'x', encoding: 'gzip' });
+      assert.ok(resp.error, 'expected error for invalid encoding');
+      assert.match(resp.error, /encoding/i);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('write with encoding=base64 and invalid characters returns error', () => {
+    const p = path.join(os.tmpdir(), `boxsh-write-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
+    try {
+      const resp = rpc({ id: '1', tool: 'write', path: p, content: '!!!not-base64!!!', encoding: 'base64' });
+      assert.ok(resp.error, 'expected error for invalid base64');
+      assert.match(resp.error, /base64/i);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
 });
 
 // ---------------------------------------------------------------------------

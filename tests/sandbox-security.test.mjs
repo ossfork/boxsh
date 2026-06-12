@@ -962,3 +962,136 @@ describe('Phase 13 — macOS system trust evaluation', () => {
       `Sandboxed SSL trust evaluation failed:\nstdout: ${sandboxVerify.stdout}\nstderr: ${sandboxVerify.stderr}`);
   });
 });
+
+// ============================================================================
+// Phase 14 — CWD preservation inside sandbox
+// ============================================================================
+
+describe('Phase 14 — CWD preservation inside sandbox', () => {
+
+  test('CWD is preserved inside sandbox (not reset to /)', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-cwd-'));
+    try {
+      const r = spawnSync(BOXSH, ['--sandbox', '-c', 'pwd'], {
+        encoding: 'utf8',
+        timeout: 8000,
+        cwd,
+      });
+      assert.equal(r.status, 0, `boxsh exited with ${r.status}: ${r.stderr}`);
+      const pwdOut = r.stdout.trim();
+      // macOS /tmp is a symlink to /private/tmp; accept either.
+      const cwdResolved = fs.realpathSync(cwd);
+      assert.ok(
+        pwdOut === cwd || pwdOut === cwdResolved || pwdOut.endsWith(cwd),
+        `expected CWD to be ${cwd} (or ${cwdResolved}), got: ${pwdOut}`,
+      );
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('CWD is preserved inside sandbox in RPC mode', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-cwd-rpc-'));
+    try {
+      const req = JSON.stringify({
+        jsonrpc: '2.0', id: '1', method: 'tools/call',
+        params: { name: 'bash', arguments: { command: 'pwd' } },
+      }) + '\n';
+      const r = spawnSync(BOXSH, ['--rpc', '--workers', '1', '--sandbox'], {
+        encoding: 'utf8',
+        timeout: 8000,
+        cwd,
+        input: req,
+      });
+      assert.equal(r.status, 0, `boxsh exited with ${r.status}: ${r.stderr}`);
+      const resp = JSON.parse(r.stdout.trim());
+      const sc = resp.result?.structuredContent;
+      assert.ok(sc, `no structuredContent in response: ${JSON.stringify(resp)}`);
+      const pwdOut = sc.stdout.trim();
+      const cwdResolved = fs.realpathSync(cwd);
+      assert.ok(
+        pwdOut === cwd || pwdOut === cwdResolved || pwdOut.endsWith(cwd),
+        `expected CWD to be ${cwd} (or ${cwdResolved}), got: ${pwdOut}`,
+      );
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('CWD preserved when overlay dir is also process CWD (COW rmdir race)', () => {
+    // Reproduces: when cwd is the COW overlay directory, sandbox_apply
+    // calls rmdir() on it (if empty) then clonefile() — the kernel CWD
+    // becomes a dangling vnode reference.  The CWD redirect in step 3
+    // must recover correctly.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-cow-base-'));
+    const overlay = path.join(os.tmpdir(), `boxsh-cow-overlay-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(overlay);
+    try {
+      // Make base non-empty so clonefile has something to clone.
+      fs.writeFileSync(path.join(base, 'base.txt'), 'base');
+
+      const r = spawnSync(BOXSH, [
+        '--rpc', '--workers', '1', '--sandbox',
+        '--bind', `cow:${base}:${overlay}`,
+      ], {
+        encoding: 'utf8',
+        timeout: 8000,
+        cwd: overlay,  // ← CWD IS the overlay, which COW step will rmdir
+        input: JSON.stringify({
+          jsonrpc: '2.0', id: '1', method: 'tools/call',
+          params: { name: 'bash', arguments: { command: 'pwd 2>&1; echo STATUS=$?' } },
+        }) + '\n',
+      });
+      assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
+      const resp = JSON.parse(r.stdout.trim());
+      const sc = resp.result?.structuredContent;
+      assert.ok(sc, `no structuredContent: ${JSON.stringify(resp)}`);
+      assert.doesNotMatch(sc.stdout || '', /getcwd/,
+        `getcwd should not fail: ${sc.stdout}`);
+      assert.match(sc.stdout || '', /STATUS=0/,
+        `command should succeed: ${sc.stdout}`);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(overlay, { recursive: true, force: true });
+    }
+  });
+
+  test('CWD preserved: COW+RO+WR with overlay as CWD', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-cow-base2-'));
+    const overlay = path.join(os.tmpdir(), `boxsh-cow-overlay2-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(overlay);
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-ro-'));
+    const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-wr-'));
+    try {
+      fs.writeFileSync(path.join(base, 'base.txt'), 'base');
+
+      const r = spawnSync(BOXSH, [
+        '--rpc', '--workers', '1', '--sandbox',
+        '--bind', `cow:${base}:${overlay}`,
+        '--bind', `ro:${repo}`,
+        '--bind', `wr:${stage}`,
+      ], {
+        encoding: 'utf8',
+        timeout: 8000,
+        cwd: overlay,
+        input: JSON.stringify({
+          jsonrpc: '2.0', id: '1', method: 'tools/call',
+          params: { name: 'bash', arguments: { command: 'pwd 2>&1 && mkdir -p x && echo OK' } },
+        }) + '\n',
+      });
+      assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
+      const resp = JSON.parse(r.stdout.trim());
+      const sc = resp.result?.structuredContent;
+      assert.ok(sc, `no structuredContent: ${JSON.stringify(resp)}`);
+      assert.doesNotMatch(sc.stdout || '', /getcwd/,
+        `getcwd should not fail: ${sc.stdout}`);
+      assert.match(sc.stdout || '', /OK/,
+        `command should succeed: ${sc.stdout}`);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(overlay, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(stage, { recursive: true, force: true });
+    }
+  });
+});

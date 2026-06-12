@@ -132,6 +132,14 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
                     return false;
                 }
                 req.content = args["content"].get<std::string>();
+                if (args.contains("encoding") && args["encoding"].is_string()) {
+                    std::string enc = args["encoding"].get<std::string>();
+                    if (enc != "text" && enc != "base64") {
+                        parse_error = "write tool encoding must be 'text' or 'base64'";
+                        return false;
+                    }
+                    req.encoding = enc;
+                }
             } else { // edit
                 req.tool = ToolKind::Edit;
                 if (!args.contains("edits") || !args["edits"].is_array()) {
@@ -364,12 +372,14 @@ static std::string mcp_tools_list_response(const json &id) {
         {"name", "write"},
         {"description",
          "Create or overwrite a file with the given content. "
-         "Parent directories are created automatically if needed."},
+         "Parent directories are created automatically if needed. "
+         "Use encoding=base64 for binary content."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
                 {"path", {{"type", "string"}, {"description", "Path to the file to write (relative or absolute)"}}},
-                {"content", {{"type", "string"}, {"description", "Content to write to the file"}}}
+                {"content", {{"type", "string"}, {"description", "Content to write to the file. When encoding is base64, this is the base64-encoded binary data."}}},
+                {"encoding", {{"type", "string"}, {"description", "Content encoding: \"text\" (default) or \"base64\""}}}
             }},
             {"required", json::array({"path", "content"})}
         }},
@@ -890,6 +900,41 @@ static RpcResponse tool_write(const RpcRequest &req) {
     resp.id   = req.id;
     resp.tool = ToolKind::Write;
 
+    // Determine the raw bytes to write.
+    std::string raw;
+    if (req.encoding == "base64") {
+        // Base64-decode req.content into raw.
+        static const char kDecodeTable[128] = {
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,62, -1,-1,-1,63,
+            52,53,54,55, 56,57,58,59, 60,61,-1,-1, -1,-1,-1,-1,
+            -1, 0, 1, 2,  3, 4, 5, 6,  7, 8, 9,10, 11,12,13,14,
+            15,16,17,18, 19,20,21,22, 23,24,25,-1, -1,-1,-1,-1,
+            -1,26,27,28, 29,30,31,32, 33,34,35,36, 37,38,39,40,
+            41,42,43,44, 45,46,47,48, 49,50,51,-1, -1,-1,-1,-1,
+        };
+        const std::string &s = req.content;
+        raw.reserve(s.size() * 3 / 4);
+        int acc = 0, bits = 0;
+        for (unsigned char c : s) {
+            if (c == '=' || c == '\n' || c == '\r') continue;
+            if (c >= 128 || kDecodeTable[c] == -1) {
+                resp.error = "write: invalid base64 character";
+                return resp;
+            }
+            acc = (acc << 6) | (unsigned char)kDecodeTable[c];
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                raw.push_back((char)(acc >> bits));
+                acc &= (1 << bits) - 1;
+            }
+        }
+    } else {
+        raw = req.content;
+    }
+
     std::ofstream f(req.path, std::ios::binary | std::ios::trunc);
     if (!f && errno == ENOENT) {
         // Auto-create parent directories (mkdir -p).
@@ -912,14 +957,14 @@ static RpcResponse tool_write(const RpcRequest &req) {
         return resp;
     }
 
-    f.write(req.content.data(), (std::streamsize)req.content.size());
+    f.write(raw.data(), (std::streamsize)raw.size());
     if (!f) {
         resp.error = std::string("write: failed writing to: ") + req.path +
                      ": " + strerror(errno);
         return resp;
     }
     f.close();
-    resp.tool_content = "written " + std::to_string(req.content.size()) + " bytes";
+    resp.tool_content = "written " + std::to_string(raw.size()) + " bytes";
     return resp;
 }
 
