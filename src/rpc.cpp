@@ -36,6 +36,31 @@ namespace {
 
 constexpr uint32_t kMaxTransportMessageBytes = 64u * 1024u * 1024u;
 
+// Truncate a UTF-8 string to at most max_bytes, never splitting a
+// multi-byte character.  Returns the truncated string with "…" appended
+// when truncation actually occurred.
+static std::string utf8_safe_truncate(const std::string &s, size_t max_bytes) {
+    if (s.size() <= max_bytes) return s;
+    size_t i = 0;
+    size_t last_valid = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t clen;
+        if ((c & 0x80) == 0)          clen = 1;
+        else if ((c & 0xE0) == 0xC0)  clen = 2;
+        else if ((c & 0xF0) == 0xE0)  clen = 3;
+        else if ((c & 0xF8) == 0xF0)  clen = 4;
+        else                          clen = 1; // invalid byte, treat as single
+
+        if (i + clen > max_bytes) break;
+        last_valid = i + clen;
+        i += clen;
+    }
+    std::string result = s.substr(0, last_valid);
+    result += "\xe2\x80\xa6"; // U+2026 HORIZONTAL ELLIPSIS "…"
+    return result;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1111,13 +1136,13 @@ static RpcResponse tool_edit(const RpcRequest &req) {
             size_t spos = stripped_content.find(stripped_old);
             if (spos == std::string::npos) {
                 resp.error = "edit: oldText not found in file: " +
-                             op.old_text.substr(0, 40);
+                             utf8_safe_truncate(op.old_text, 40);
                 return resp;
             }
             // Check uniqueness in stripped space.
             if (stripped_content.find(stripped_old, spos + 1) != std::string::npos) {
                 resp.error = "edit: oldText is not unique in file: " +
-                             op.old_text.substr(0, 40);
+                             utf8_safe_truncate(op.old_text, 40);
                 return resp;
             }
             // Map stripped position back to original content position.
@@ -1129,7 +1154,7 @@ static RpcResponse tool_edit(const RpcRequest &req) {
             // Check uniqueness for exact match.
             if (content.find(old_normalized, pos + 1) != std::string::npos) {
                 resp.error = "edit: oldText is not unique in file: " +
-                             op.old_text.substr(0, 40);
+                             utf8_safe_truncate(op.old_text, 40);
                 return resp;
             }
         }
