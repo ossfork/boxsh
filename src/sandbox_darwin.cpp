@@ -234,6 +234,20 @@ static std::string build_sbpl(const SandboxConfig &cfg) {
         p += "\"))\n";
     }
 
+    // On macOS, /System/Volumes contains APFS volume mount points (Data,
+    // Preboot, VM, etc.).  The data volume (/System/Volumes/Data) is already
+    // reachable through root-level firmlinks (/Users, /usr/local, /opt, …),
+    // so allowing recursive traversal through the mount point causes commands
+    // like `find /` to walk the entire data volume twice — roughly doubling
+    // the number of inodes visited and causing frequent timeouts.
+    //
+    // Explicit deny overrides the (allow file-read* (subpath "/System")) rule
+    // above.  SBPL evaluates deny rules after allow rules for the same
+    // operation, so this correctly blocks /System/Volumes and everything
+    // beneath it while keeping /System/Library, /System/Applications, etc.
+    // accessible.
+    p += "(deny file-read* (subpath \"/System/Volumes\"))\n";
+
     // Process permissions — only exec, fork, and same-sandbox info/signal.
     p += "(allow process-exec)\n";
     p += "(allow process-fork)\n";
