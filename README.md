@@ -512,8 +512,8 @@ node --test tests/index.test.mjs
 | `tools.test.mjs` | Built-in tools: read (offset/limit), write, edit (diff, uniqueness checks) |
 | `mcp.test.mjs` | MCP protocol: initialize, tools/list, tools/call, notifications, handshake |
 | `protocol-regression.test.mjs` | Content-Length transport, ID type preservation, initialize handshake, error distinction |
-| `docker.test.mjs` | Container engine contract: engine switch, COW via fuse-overlayfs, sandbox isolation (auto-skips on host) |
-| `docker-negative.test.mjs` | Negative path: COW without `/dev/fuse` reports actionable error (auto-skips on host) |
+| `docker.test.mjs` | Container engine contract: engine switch, COW via fuse-overlayfs, sandbox isolation (run by `docker-test.sh`, not in `index.test.mjs`) |
+| `docker-negative.test.mjs` | Negative path: COW without `/dev/fuse` reports actionable error (run by `docker-test.sh`, not in `index.test.mjs`) |
 | `docker-test.sh` | Dev/CI Docker test runner: supports `--vol=bind` (host-mapped) and `--vol=tmpfs` (ephemeral) modes |
 
 ---

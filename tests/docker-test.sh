@@ -86,6 +86,11 @@ run_suites() {
   local COMMON="-w /src -e BOXSH=/src/build/boxsh $IMAGE_TAG"
 
   echo ""
+  echo "========== Container contract ($LABEL) =========="
+  docker run --rm $PRIV_FULL $VOL_OPTS $COMMON \
+    sh -c 'node --test tests/docker.test.mjs'
+
+  echo ""
   echo "========== Full suite ($LABEL) =========="
   docker run --rm $PRIV_FULL $VOL_OPTS $COMMON \
     sh -c 'node --test tests/index.test.mjs'
