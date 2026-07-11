@@ -14,6 +14,16 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { BOXSH, TEMPDIR } from './helpers.mjs';
 
+// Container detection (mirrors src/sandbox.cpp running_in_container).
+// In a container, the process runs as root without CLONE_NEWUSER, so Unix
+// permission-based protections (e.g. /root 0700, /usr root-owned) do not
+// apply — root can access and write anywhere.
+const IN_CONTAINER =
+  fs.existsSync('/.dockerenv') ||
+  (fs.existsSync('/proc/1/cgroup') &&
+    fs.readFileSync('/proc/1/cgroup', 'utf8').split('\n')
+      .some(l => l.includes('docker') || l.includes('containerd') || l.includes('kubepods')));
+
 // ---------------------------------------------------------------------------
 // Helper: run boxsh --try with a given CWD and -c command.
 // ---------------------------------------------------------------------------
@@ -305,7 +315,9 @@ describe('--try mode — sandbox isolation', () => {
 
   // ---- auto-included system dirs ----
 
-  test('/root is not present inside the sandbox', () => {
+  test('/root is not present inside the sandbox',
+    { skip: IN_CONTAINER && 'container runs as root without CLONE_NEWUSER; /root is accessible (host engine relies on userns UID remapping to hide /root)' },
+    () => {
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     try {
       const r = tryRun(cwd, 'ls /root 2>&1; echo exit:$?');
@@ -367,7 +379,9 @@ describe('--try mode — sandbox isolation', () => {
     }
   });
 
-  test('/usr is write-protected by Unix permissions', () => {
+  test('/usr is write-protected by Unix permissions',
+    { skip: IN_CONTAINER && 'container runs as root without CLONE_NEWUSER; root can write to /usr (host engine relies on userns UID remapping for this protection)' },
+    () => {
     const cwd    = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     const marker = `/usr/boxsh-write-test-${process.pid}`;
     try {

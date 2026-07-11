@@ -432,8 +432,30 @@ boxsh --sandbox --bind wr:/data -c 'ls /'
 |---|---|---|
 | Linux | User/mount/PID namespaces + seccomp syscall filter | overlayfs (kernel ≥ 5.11 for user-ns) |
 | macOS | Seatbelt (`sandbox_init` + SBPL) | `clonefile(2)` on APFS |
+| Linux (Docker) | Mount/PID namespaces + seccomp (auto-detected, skips userns) | fuse-overlayfs |
 
 No external tools such as `bwrap` or `newuidmap` are required on any platform.
+
+### Docker support
+
+boxsh automatically detects Docker/containerd/K8s containers and switches to the **container sandbox engine**: it skips user namespaces (unnecessary in a pre-isolated container, and incompatible with rootless/userns-remapped Docker) and routes COW through fuse-overlayfs to avoid overlay-on-overlay kernel restrictions.
+
+**Container startup flags required:**
+
+```sh
+docker run \
+  --cap-add SYS_ADMIN \                   # mount/pivot_root/unshare
+  --security-opt seccomp=unconfined \     # allow unshare/mount syscalls
+  --security-opt apparmor=unconfined \    # allow mount --make-rslave /
+  --device /dev/fuse                      # fuse-overlayfs COW
+```
+
+If any flag is missing, boxsh reports an actionable error:
+- Missing `SYS_ADMIN` or `seccomp=unconfined` → `unshare (container mode): ...; boxsh inside Docker requires: --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined`
+- Missing `apparmor=unconfined` → `mount --make-rslave /: ...; container must be started with --security-opt apparmor=unconfined`
+- Missing `/dev/fuse` → `...container is missing /dev/fuse — start Docker with --device /dev/fuse`
+
+The container engine preserves full sandbox isolation: mount/PID namespaces, pivot_root to a clean tmpfs, seccomp syscall filtering, and RO/WR/COW bind mounts. The only difference from the host engine is the absence of user-namespace UID remapping (the process runs as actual root, not a mapped unprivileged user). See [Docker Usage](docs/usage.md#docker-usage) for end-to-end examples.
 
 ---
 
@@ -490,6 +512,9 @@ node --test tests/index.test.mjs
 | `tools.test.mjs` | Built-in tools: read (offset/limit), write, edit (diff, uniqueness checks) |
 | `mcp.test.mjs` | MCP protocol: initialize, tools/list, tools/call, notifications, handshake |
 | `protocol-regression.test.mjs` | Content-Length transport, ID type preservation, initialize handshake, error distinction |
+| `docker.test.mjs` | Container engine contract: engine switch, COW via fuse-overlayfs, sandbox isolation (auto-skips on host) |
+| `docker-negative.test.mjs` | Negative path: COW without `/dev/fuse` reports actionable error (auto-skips on host) |
+| `docker-test.sh` | Dev/CI Docker test runner: supports `--vol=bind` (host-mapped) and `--vol=tmpfs` (ephemeral) modes |
 
 ---
 

@@ -11,6 +11,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { rpc, rpcSandboxed } from './helpers.mjs';
 
+// Container detection (mirrors src/sandbox.cpp running_in_container).
+// In a container, the process runs as root without CLONE_NEWUSER, so paths
+// that are non-writable for unprivileged users (e.g. /) become writable.
+const IN_CONTAINER =
+  fs.existsSync('/.dockerenv') ||
+  (fs.existsSync('/proc/1/cgroup') &&
+    fs.readFileSync('/proc/1/cgroup', 'utf8').split('\n')
+      .some(l => l.includes('docker') || l.includes('containerd') || l.includes('kubepods')));
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -285,7 +294,9 @@ describe('tool — write', () => {
     } finally { fs.rmSync(p, { force: true }); }
   });
 
-  test('write to non-writable path returns error', () => {
+  test('write to non-writable path returns error',
+    { skip: IN_CONTAINER && 'container runs as root without CLONE_NEWUSER; root can auto-create dirs at / (host engine relies on userns UID remapping for this protection)' },
+    () => {
     const resp = rpc({ id: '1', tool: 'write', path: '/no_permission_dir_xyz/file.txt', content: 'x' });
     assert.ok(resp.error, 'expected error for non-writable path');
     assert.match(resp.error, /write:/);

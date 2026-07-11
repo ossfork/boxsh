@@ -23,6 +23,7 @@ This guide walks through the core scenarios boxsh is built for, with concrete ex
 - [Scenario 7: Agent Interactive Terminal](#scenario-7-agent-interactive-terminal)
 - [Reference](#reference)
   - [Installation](#installation)
+  - [Docker Usage](#docker-usage)
   - [Shell Mode](#shell-mode)
   - [Quick-try Mode](#quick-try-mode)
   - [RPC Mode](#rpc-mode)
@@ -746,6 +747,51 @@ cmake --build build
 ```
 
 The resulting binary is `build/boxsh`. Copy it anywhere on your `$PATH`.
+
+### Docker Usage
+
+boxsh detects Docker/containerd/K8s containers automatically and switches to the **container sandbox engine** — no configuration needed. The container engine skips user namespaces (unnecessary and incompatible with rootless Docker) and uses fuse-overlayfs for COW (kernel overlay-on-overlay is unsupported on overlay2 root filesystems).
+
+**Required container privileges.** Start the container with these four flags:
+
+```sh
+docker run --rm \
+  --cap-add SYS_ADMIN \                   # mount/pivot_root/unshare
+  --security-opt seccomp=unconfined \     # allow unshare/mount syscalls
+  --security-opt apparmor=unconfined \    # allow mount --make-rslave /
+  --device /dev/fuse \                    # fuse-overlayfs COW
+  your-image
+```
+
+| Flag | Purpose | Error if missing |
+|------|---------|-----------------|
+| `--cap-add SYS_ADMIN` | Allows `mount`, `pivot_root`, `unshare(CLONE_NEWNS)` | `unshare (container mode): Operation not permitted; boxsh inside Docker requires: --cap-add SYS_ADMIN ...` |
+| `--security-opt seccomp=unconfined` | Docker's default seccomp profile blocks `unshare` and `mount` | `unshare (container mode): Invalid argument` |
+| `--security-opt apparmor=unconfined` | Default AppArmor profile denies `mount --make-rslave /` | `mount --make-rslave /: Permission denied; container must be started with --security-opt apparmor=unconfined` |
+| `--device /dev/fuse` | fuse-overlayfs needs `/dev/fuse` for COW bind mounts | `container is missing /dev/fuse — start Docker with --device /dev/fuse` (only when using COW) |
+
+**Usage inside the container is identical to host mode.** All commands, flags, and tools work the same way:
+
+```sh
+# Inside the container — works exactly like on the host
+boxsh --sandbox -c 'echo hello'
+boxsh --try
+boxsh --rpc --workers 4 --sandbox --bind cow:"/project:/tmp/dst"
+```
+
+**Behavioral differences from host engine:**
+
+- The process runs as **actual root** inside the sandbox (no user-namespace UID remapping). This means system paths like `/etc` and `/usr` are writable — these are protected by mount-ns isolation (`pivot_root` to a fresh tmpfs), not by Unix permissions.
+- COW persistence behavior is identical — writes accumulate in the destination directory, survive across commands within the same session, and can be resumed across sessions.
+- `--try` mode creates its temporary directory under the current working directory's filesystem (as on the host), and prints the save path to stderr on exit.
+
+**Testing inside Docker.** The project includes a dev/CI test runner:
+
+```sh
+bash tests/docker-test.sh              # both volume modes (default)
+bash tests/docker-test.sh --vol=bind   # host-mapped volume only
+bash tests/docker-test.sh --vol=tmpfs  # ephemeral tmpfs only
+```
 
 ### Shell Mode
 

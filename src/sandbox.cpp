@@ -21,6 +21,8 @@
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
+#include <linux/magic.h>
+#include <sys/vfs.h>
 #include <stddef.h>
 
 namespace boxsh {
@@ -73,6 +75,56 @@ static bool path_exists(const std::string &path) {
 static bool path_lexists(const std::string &path) {
     struct stat st;
     return lstat(path.c_str(), &st) == 0;
+}
+
+// Detect whether boxsh is running inside a container (Docker/containerd/K8s).
+// Result is computed once and cached.  Used to switch sandbox_apply() to the
+// "container engine": skip CLONE_NEWUSER (unnecessary + fails to nest under
+// userns-remapped/rootless Docker) and route COW through fuse-overlayfs
+// (kernel overlay-on-overlay is unsupported on overlay2 root filesystems).
+//
+// Detection signals (any one is sufficient):
+//   - /.dockerenv                  (Docker creates this in every container)
+//   - /proc/1/cgroup mentions docker/containerd/kubepods
+//   - statfs("/") reports OVERLAYFS_SUPER_MAGIC (overlay2 storage driver)
+static bool running_in_container() {
+    static int cached = -1;
+    if (cached != -1) return cached == 1;
+    cached = 0;
+
+    if (path_exists("/.dockerenv")) { cached = 1; return true; }
+
+    FILE *f = fopen("/proc/1/cgroup", "re");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            if (std::strstr(line, "docker") ||
+                std::strstr(line, "containerd") ||
+                std::strstr(line, "kubepods")) {
+                cached = 1;
+                fclose(f);
+                return true;
+            }
+        }
+        fclose(f);
+    }
+
+    struct statfs sb;
+    if (statfs("/", &sb) == 0 && sb.f_type == OVERLAYFS_SUPER_MAGIC) {
+        cached = 1;
+        return true;
+    }
+
+    return false;
+}
+
+// Whether the config requests any COW bind (which needs fuse-overlayfs in a
+// container, and therefore /dev/fuse).  Used to tailor error messages.
+static bool has_cow_bind(const SandboxConfig &cfg) {
+    for (const auto &bm : cfg.bind_mounts) {
+        if (bm.mode == BindMount::Mode::COW) return true;
+    }
+    return false;
 }
 
 static bool ensure_file_mountpoint(const std::string &path, std::string &err) {
@@ -433,10 +485,33 @@ static int do_pivot_root(const char *new_root, const char *put_old) {
     return syscall(SYS_pivot_root, new_root, put_old);
 }
 
+// Search $PATH for an executable, mirroring what execlp() would do.  Used so
+// the fuse-overlayfs pre-check matches the exec search and so any install
+// location (not just /usr/bin and /usr/local/bin) is accepted.
+static bool fuse_overlayfs_available() {
+    const char *path = std::getenv("PATH");
+    if (!path || path[0] == '\0') path = "/usr/bin:/bin";
+    std::string p = path;
+    size_t start = 0;
+    while (start <= p.size()) {
+        size_t end = p.find(':', start);
+        std::string dir = (end == std::string::npos)
+            ? p.substr(start) : p.substr(start, end - start);
+        if (!dir.empty()) {
+            std::string full = dir + "/fuse-overlayfs";
+            if (access(full.c_str(), X_OK) == 0) return true;
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return false;
+}
+
 // Try to mount an overlay using fuse-overlayfs(1).  This is the fallback
 // when kernel overlayfs fails (e.g. XFS with large inodes in a user
-// namespace).  fuse-overlayfs runs entirely in userspace via FUSE and is
-// not affected by kernel-level file-handle encoding limitations.
+// namespace, or overlay-on-overlay inside a Docker container).  fuse-overlayfs
+// runs entirely in userspace via FUSE and is not affected by kernel-level
+// file-handle encoding limitations or stacked-overlay restrictions.
 //
 // fuse-overlayfs daemonises itself by default.  We fork+exec and then
 // wait for the mount point to appear (poll the mount table).
@@ -446,8 +521,7 @@ static bool try_fuse_overlayfs(const std::string &lowerdir,
                                 const std::string &work,
                                 std::string &err) {
     // Check whether the binary is available before forking.
-    if (access("/usr/bin/fuse-overlayfs", X_OK) != 0 &&
-        access("/usr/local/bin/fuse-overlayfs", X_OK) != 0) {
+    if (!fuse_overlayfs_available()) {
         err = "fuse-overlayfs not found; "
               "install it with: apt install fuse-overlayfs";
         return false;
@@ -517,31 +591,47 @@ static bool mount_overlay_at(const std::string &lowerdir,
                                std::string &err) {
     if (!mkdir_p(dest, 0755, err)) return false;
 
-    // xino=off: disable cross-inode-number encoding between lower and upper
-    // layers.  Without this, overlayfs copy-up fails with EOVERFLOW when the
-    // lower filesystem has inode numbers that exceed the representable range.
-    std::string opts = "lowerdir=" + lowerdir +
-                       ",upperdir=" + upper +
-                       ",workdir="  + work +
-                       ",xino=off";
-    if (mount("overlay", dest.c_str(), "overlay", 0, opts.c_str()) == 0)
-        return true;
+    // Inside a container the root filesystem is typically overlay2, and the
+    // kernel refuses to stack an overlay on top of overlayfs paths
+    // (overlay-on-overlay).  Skip the doomed kernel attempt and go straight
+    // to fuse-overlayfs, which is userspace and unaffected by this limit.
+    if (!running_in_container()) {
+        // xino=off: disable cross-inode-number encoding between lower and upper
+        // layers.  Without this, overlayfs copy-up fails with EOVERFLOW when the
+        // lower filesystem has inode numbers that exceed the representable range.
+        std::string opts = "lowerdir=" + lowerdir +
+                           ",upperdir=" + upper +
+                           ",workdir="  + work +
+                           ",xino=off";
+        if (mount("overlay", dest.c_str(), "overlay", 0, opts.c_str()) == 0)
+            return true;
 
-    // Fall back to fuse-overlayfs for the two user-namespace failure modes we
-    // see in practice: EINVAL on XFS with large inodes and EPERM when nested
-    // containers block kernel overlay mounts without CAP_SYS_ADMIN.
-    int saved_errno = errno;
-    if (saved_errno != EINVAL && saved_errno != EPERM) {
-        err = errno_str(("mount overlay -> " + dest).c_str());
-        return false;
+        // Fall back to fuse-overlayfs for the user-namespace failure modes we
+        // see in practice: EINVAL on XFS with large inodes, EPERM when nested
+        // containers block kernel overlay mounts without CAP_SYS_ADMIN, and
+        // ENOTSUP for overlay-on-overlay.
+        int saved_errno = errno;
+        if (saved_errno != EINVAL && saved_errno != EPERM &&
+            saved_errno != ENOTSUP) {
+            err = errno_str(("mount overlay -> " + dest).c_str());
+            return false;
+        }
+
+        std::fprintf(stderr,
+            "boxsh: kernel overlay mount failed (%s), trying fuse-overlayfs...\n",
+            std::strerror(saved_errno));
     }
-
-    std::fprintf(stderr,
-        "boxsh: kernel overlay mount failed (%s), trying fuse-overlayfs...\n",
-        std::strerror(saved_errno));
 
     if (try_fuse_overlayfs(lowerdir, dest, upper, work, err))
         return true;
+
+    // fuse-overlayfs failed — augment with a container-specific /dev/fuse hint
+    // when the FUSE device is missing, so the user gets an actionable message
+    // rather than a bare exit-status error.
+    if (running_in_container() && access("/dev/fuse", R_OK | W_OK) != 0) {
+        err += "; container is missing /dev/fuse — "
+               "start Docker with --device /dev/fuse";
+    }
 
     // Both methods failed — report the fuse-overlayfs error which contains
     // an actionable install hint.
@@ -724,17 +814,53 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     // CLONE_NEWPID isolates the process tree: the next fork()'d child becomes
     // PID 1 in a new PID namespace.  Host processes are invisible, and signals
     // cannot escape the namespace boundary.
-    int unshare_flags = CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWPID;
+    //
+    // Two engines:
+    //   * host engine      — CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID.
+    //     NEWUSER lets an unprivileged user gain the mount capability needed
+    //     for CLONE_NEWNS without sudo.
+    //   * container engine — CLONE_NEWNS | CLONE_NEWPID only.  Inside a Docker
+    //     container that already grants CAP_SYS_ADMIN, NEWUSER is unnecessary
+    //     and harmful: it fails to nest under userns-remapped/rootless Docker
+    //     and is blocked by the default seccomp profile.  The container's own
+    //     uid context is reused.
+    const bool in_container = running_in_container();
+    int unshare_flags;
+    if (in_container) {
+        unshare_flags = CLONE_NEWNS | CLONE_NEWPID;
+    } else {
+        unshare_flags = CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWPID;
+    }
     if (cfg.new_net_ns)  unshare_flags |= CLONE_NEWNET;
 
     if (unshare(unshare_flags) != 0) {
-        res.error = errno_str("unshare");
+        if (in_container) {
+            res.error = errno_str("unshare (container mode)") +
+                "; boxsh inside Docker requires: "
+                "--cap-add SYS_ADMIN "
+                "--security-opt seccomp=unconfined "
+                "--security-opt apparmor=unconfined"
+                + (has_cow_bind(cfg) ? " --device /dev/fuse" : "");
+        } else {
+            res.error = errno_str("unshare");
+        }
         return res;
     }
 
+    // Container engine switched successfully — announce it once so users can
+    // confirm the engine change (and that COW is going through fuse-overlayfs).
+    if (in_container) {
+        std::fprintf(stderr,
+            "boxsh: container detected, using container sandbox engine"
+            " (fuse-overlayfs COW)\n");
+    }
+
     // --- 2. Write uid/gid mapping ---
-    // When called via unshare() (no separate fork) we write the map ourselves.
-    {
+    // Only needed with CLONE_NEWUSER: the map makes the caller appear as root
+    // inside the new user namespace.  The container engine skips NEWUSER, so
+    // it reuses the container's existing ids and must not write these maps.
+    if (!in_container) {
+        // When called via unshare() (no separate fork) we write the map ourselves.
         char self_setgroups[] = "/proc/self/setgroups";
         if (!write_file(self_setgroups, "deny") && errno != ENOENT) {
             res.error = errno_str("write setgroups deny");
@@ -761,6 +887,13 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     // --- 3. Make all existing mounts private so our changes don't propagate ---
     if (mount(nullptr, "/", nullptr, MS_SLAVE | MS_REC, nullptr) != 0) {
         res.error = errno_str("mount --make-rslave /");
+        // In a container this fails under Docker's default AppArmor profile even
+        // with CAP_SYS_ADMIN + seccomp=unconfined; the user must also disable
+        // AppArmor confinement for the container.
+        if (in_container) {
+            res.error += "; container must be started with "
+                         "--security-opt apparmor=unconfined";
+        }
         return res;
     }
 

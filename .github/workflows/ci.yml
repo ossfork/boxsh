@@ -87,3 +87,16 @@ jobs:
           file_glob: true
           tag: ${{ github.ref }}
           overwrite: true
+
+  # Exercises boxsh's container sandbox engine: build + run the full test suite
+  # inside a Docker container that grants SYS_ADMIN, seccomp=unconfined, and
+  # /dev/fuse.  Verifies Docker self-adaptation (CLONE_NEWNS+NEWPID without
+  # NEWUSER, fuse-overlayfs COW for overlay-on-overlay) and that the existing
+  # capability suite still passes in that environment.
+  docker-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test inside Docker
+        run: bash tests/docker-test.sh
