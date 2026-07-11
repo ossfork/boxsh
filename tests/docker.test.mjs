@@ -28,7 +28,7 @@ const IN_CONTAINER =
     fs.readFileSync('/proc/1/cgroup', 'utf8').split('\n')
       .some(l => l.includes('docker') || l.includes('containerd') || l.includes('kubepods')));
 
-const skip = !IN_CONTAINER && 'not running inside a container';
+const skip = !IN_CONTAINER && 'not running inside a container — docker tests run in the separate docker-test CI job';
 
 // --- helpers ---------------------------------------------------------------
 
